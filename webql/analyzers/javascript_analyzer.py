@@ -7,10 +7,11 @@ from pathlib import Path
 from rich.progress import Progress
 from rich.console import Console
 import hashlib
+import sys
 
 from .webcrack_analyzer import WebcrackAnalyzer
 
-console = Console()
+console = Console(file=sys.stderr)
 
 class JavaScriptAnalyzer:
     def __init__(self, targets, output_dir, aggressive=False, verbose=False):
@@ -20,7 +21,7 @@ class JavaScriptAnalyzer:
         self.verbose = verbose
         self.session = requests.Session()
         self.visited_urls = set()
-        self.progress = Progress()
+        self.progress = Progress(console=Console(file=sys.stderr))
         self.main_task_id = None
         self.webcrack_analyzer = WebcrackAnalyzer(output_dir, verbose)
 

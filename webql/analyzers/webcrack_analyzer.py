@@ -1,9 +1,9 @@
 import subprocess
 from pathlib import Path
 from rich.console import Console
+import sys
 
-
-console = Console()
+console = Console(file=sys.stderr)
 
 class WebcrackAnalyzer:
     def __init__(self, output_dir, verbose=False):

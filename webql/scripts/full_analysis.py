@@ -6,8 +6,9 @@ import subprocess
 from rich.console import Console
 from urllib.parse import urlparse
 from datetime import datetime
+import sys
 
-console = Console()
+console = Console(file=sys.stderr)
 
 
 def run_command(command):

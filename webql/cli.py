@@ -30,16 +30,18 @@ import shlex
 # Install rich traceback handler
 install(show_locals=True)
 
+console = Console()  # Default to stdout
+console_err = Console(file=sys.stderr)  # Stderr for informational output
+
 # Set up logging
 logging.basicConfig(
     level="INFO",
     format="%(message)s",
     datefmt="[%X]",
-    handlers=[RichHandler(rich_tracebacks=True)],
+    handlers=[RichHandler(rich_tracebacks=True, console=console_err)],
 )
 
 log = logging.getLogger("webql")
-console = Console()
 
 
 def truncate_string(string, max_length):
@@ -73,10 +75,10 @@ def check_url_status(url):
         if response.status_code in [200, 301, 302]:
             return True
         else:
-            console.print(f"[bold red]Error: Received status code {response.status_code} for URL {url}[/bold red]")
+            console_err.print(f"[bold red]Error: Received status code {response.status_code} for URL {url}[/bold red]")
             return False
     except requests.RequestException as e:
-        console.print(f"[bold red]Error: Failed to reach {url}: {e}[/bold red]")
+        console_err.print(f"[bold red]Error: Failed to reach {url}: {e}[/bold red]")
         return False
 
 
@@ -94,7 +96,7 @@ def run_trufflehog(target_dir, output_dir):
     
     scan_command = f"trufflehog filesystem --directory {target_path} --json > {output_file}"
     output, error, returncode = run_command(scan_command)
-    console.print(output, markup=False, highlight=False)
+    console_err.print(output, markup=False, highlight=False)
     
     if returncode != 0:
         raise Exception(f"Error scanning for secrets: {error}")
@@ -149,22 +151,22 @@ def scan(ctx, targets, output_dir, aggressive, verbose, secrets, url_file):
         if not targets:
             raise click.UsageError("At least one target URL or --url-file must be provided.")
 
-        log.info(f"Starting scan of {len(targets)} target(s)")
+        console_err.print(f"[cyan]Starting scan of {len(targets)} target(s)[/cyan]")
         analyzer = JavaScriptAnalyzer(targets, output_dir, aggressive=aggressive, verbose=verbose)
 
         analyzer.scan()
-        log.info(f"Scan completed. Results saved to {output_dir}")
+        console_err.print(f"[green]Scan completed. Results saved to {output_dir}[/green]")
 
         if secrets:
-            log.info("Running secrets scanning modules...")
+            console_err.print("[cyan]Running secrets scanning modules...[/cyan]")
             for target in targets:
                 run_trufflehog(target, output_dir)
-            log.info("Secrets scanning completed.")
+            console_err.print("[green]Secrets scanning completed.[/green]")
 
     except WebQLException as e:
-        log.error(f"WebQL Error: {str(e)}")
+        console_err.print(f"[bold red]WebQL Error: {str(e)}[/bold red]")
     except Exception as e:
-        log.error(f"Unexpected error: {str(e)}")
+        console_err.print(f"[bold red]Unexpected error: {str(e)}[/bold red]")
 
 
 @cli.command()
@@ -184,40 +186,40 @@ def full_analysis(ctx, targets, exp_name, output_dir, secrets):
         output_path = Path.cwd() / output_dir / exp_name
         output_path.mkdir(parents=True, exist_ok=True)
 
-        console.print(f"[bold blue]Output directory: {output_path}[/bold blue]")
+        console_err.print(f"[bold blue]Output directory: {output_path}[/bold blue]")
 
         # Step 1: Scan the URL
-        console.print("[yellow]Step 1: Scanning URL for JavaScript files...[/yellow]")
+        console_err.print("[yellow]Step 1: Scanning URL for JavaScript files...[/yellow]")
         ctx.invoke(scan, targets=targets, output_dir=str(output_path), aggressive=False, verbose=False, secrets=False, url_file=None)
 
         # Step 2: Generate CodeQL database
-        console.print("[yellow]Step 2: Generating CodeQL database...[/yellow]")
+        console_err.print("[yellow]Step 2: Generating CodeQL database...[/yellow]")
         db_name = f"{exp_name}_db"
         db_path = output_path / db_name
         ctx.invoke(generate, source_path=str(output_path), db_name=str(db_path), overwrite=True)
 
-        console.print(f"[bold cyan]Database path: {db_path}[/bold cyan]")
-        console.print(f"[bold cyan]Database exists: {db_path.exists()}[/bold cyan]")
+        console_err.print(f"[bold cyan]Database path: {db_path}[/bold cyan]")
+        console_err.print(f"[bold cyan]Database exists: {db_path.exists()}[/bold cyan]")
 
         # Step 3: Analyze the database
-        console.print("[yellow]Step 3: Analyzing the database...[/yellow]")
+        console_err.print("[yellow]Step 3: Analyzing the database...[/yellow]")
         sarif_file = output_path / f"{exp_name}_results.sarif"
         ctx.invoke(parse, db_path=str(db_path), output_file=str(sarif_file))
 
         # Step 4: Display results
-        console.print("[yellow]Step 4: Displaying results...[/yellow]")
+        console_err.print("[yellow]Step 4: Displaying results...[/yellow]")
         ctx.invoke(results, results_file=str(sarif_file), format="text")
 
-        console.print("[bold green]Full analysis completed successfully![/bold green]")
-        console.print(f"[bold green]Results are saved in: {output_path}[/bold green]")
+        console_err.print("[bold green]Full analysis completed successfully![/bold green]")
+        console_err.print(f"[bold green]Results are saved in: {output_path}[/bold green]")
 
         if secrets:
-            log.info("Running secrets scanning modules...")
+            console_err.print("[cyan]Running secrets scanning modules...[/cyan]")
             run_trufflehog(str(output_path), str(output_path))
-            log.info("Secrets scanning completed.")
+            console_err.print("[green]Secrets scanning completed.[/green]")
 
     except Exception as e:
-        console.print(f"[bold red]Error during full analysis: {str(e)}[/bold red]")
+        console_err.print(f"[bold red]Error during full analysis: {str(e)}[/bold red]")
         log.exception("Full analysis failed")
 
 
@@ -235,11 +237,11 @@ def generate(source_path, db_name, overwrite):
         
         result = generate_command(str(source_path), str(db_path), overwrite)
         if result:
-            console.print(f"[bold green]CodeQL database generated at: {db_path}[/bold green]")
+            console_err.print(f"[bold green]CodeQL database generated at: {db_path}[/bold green]")
         else:
-            console.print("[bold red]Failed to generate CodeQL database[/bold red]")
+            console_err.print("[bold red]Failed to generate CodeQL database[/bold red]")
     except Exception as e:
-        console.print(f"[bold red]Error during database generation: {str(e)}[/bold red]")
+        console_err.print(f"[bold red]Error during database generation: {str(e)}[/bold red]")
         log.exception("Database generation failed")
 
 
@@ -274,11 +276,11 @@ def results(results_file, format):
         vulnerabilities = results_command(results_file)
         
         if vulnerabilities is None:
-            console.print("[bold yellow]No vulnerabilities found or error in parsing results.[/bold yellow]")
+            console_err.print("[bold yellow]No vulnerabilities found or error in parsing results.[/bold yellow]")
             return
 
         if format == 'json':
-            console.print_json(data=vulnerabilities)
+            console.print_json(data=vulnerabilities)  # JSON to stdout
         else:
             table = Table(
                 title="Vulnerability Results",
@@ -300,11 +302,11 @@ def results(results_file, format):
                         shorten_location(vuln['location']),
                     )
             
-            console.print(table)
+            console.print(table)  # Table to stdout
         
-        console.print("[bold green]Results processing completed[/bold green]")
+        console_err.print("[bold green]Results processing completed[/bold green]")
     except Exception as e:
-        console.print(f"[bold red]Error: {str(e)}[/bold red]")
+        console_err.print(f"[bold red]Error: {str(e)}[/bold red]")
         log.exception("Results parsing failed")
 
 
@@ -337,7 +339,7 @@ def trufflehog(target, output_dir):
         # Run the trufflehog scan command
         scan_command = f"trufflehog filesystem --directory {target_path} --json > {output_file}"
         output, error, returncode = run_command(scan_command)
-        console.print(output, markup=False, highlight=False)
+        console_err.print(output, markup=False, highlight=False)
         
         if returncode != 0:
             raise Exception(f"Error scanning for secrets: {error}")

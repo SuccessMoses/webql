@@ -5,8 +5,9 @@ from ..analyzers.codeql_analyzer import CodeQLAnalyzer
 from ..utils.js_beautifier import beautify_js_directory
 from rich.console import Console
 import logging
+import sys
 
-console = Console()
+console = Console(file=sys.stderr)
 log = logging.getLogger(__name__)
 
 

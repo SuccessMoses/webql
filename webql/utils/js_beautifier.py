@@ -4,8 +4,9 @@ import jsbeautifier
 from pathlib import Path
 from rich.console import Console
 import logging
+import sys
 
-console = Console()
+console = Console(file=sys.stderr)
 log = logging.getLogger(__name__)
 
 

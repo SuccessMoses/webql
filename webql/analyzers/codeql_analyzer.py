@@ -5,8 +5,9 @@ import json
 from pathlib import Path
 from rich.console import Console
 from urllib.parse import urljoin
+import sys
 
-console = Console()
+console = Console(file=sys.stderr)
 
 
 class CodeQLAnalyzer:
