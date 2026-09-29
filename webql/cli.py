@@ -2,6 +2,8 @@ import shutil
 from pathlib import Path
 import subprocess
 import requests
+import os
+import sys
 
 import click
 from rich.box import MINIMAL, ROUNDED
@@ -43,21 +45,27 @@ console = Console()
 def truncate_string(string, max_length):
     return (string[: max_length - 3] + "...") if len(string) > max_length else string
 
+
 def get_unique_output_dir(url, base_dir='webql_output'):
     parsed_url = urlparse(url)
     domain = parsed_url.netloc.replace('.', '_')
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return Path(base_dir) / f"{domain}_{timestamp}"
 
-def run_command(command):
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-    output, error = process.communicate()
-    return output.decode(), error.decode()
 
-# def get_safe_filename(url):
-#     """Convert URL to a safe filename."""
-#     parsed_url = urlparse(url)
-#     return f"{parsed_url.netloc.replace('.', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+def run_command(command):
+    """Run a subprocess command with the current terminal width passed to the child."""
+    env = {**os.environ, "COLUMNS": str(console.width)}
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        shell=True,
+        env=env
+    )
+    output, error = process.communicate()
+    return output.decode(), error.decode(), process.returncode
+
 
 def check_url_status(url):
     try:
@@ -70,20 +78,29 @@ def check_url_status(url):
     except requests.RequestException as e:
         console.print(f"[bold red]Error: Failed to reach {url}: {e}[/bold red]")
         return False
-    
-def run_trufflehog(target, output_dir):
+
+
+def shorten_location(loc, max_len=60):
+    """Keep the tail (filename + line:col), which is the useful part."""
+    return loc if len(loc) <= max_len else "…" + loc[-(max_len - 1):]
+
+
+def run_trufflehog(target_dir, output_dir):
     """Run truffleHog scan on the downloaded JS directory and save the results to the output directory."""
-    parsed_url = urlparse(target)
-    domain = parsed_url.netloc.replace('.', '_')
+    target_path = Path(target_dir)
     output_path = Path(output_dir) / "secrets"
     output_path.mkdir(parents=True, exist_ok=True)
-    output_file = output_path / f"trufflehog_{domain}_output.txt"
-    scan_command = f"trufflehog filesystem --directory {target} --json > {output_file}"
-    output, error = run_command(scan_command)
-    console.print(output)
-    if error:
+    output_file = output_path / f"trufflehog_{target_path.name}_output.txt"
+    
+    scan_command = f"trufflehog filesystem --directory {target_path} --json > {output_file}"
+    output, error, returncode = run_command(scan_command)
+    console.print(output, markup=False, highlight=False)
+    
+    if returncode != 0:
         raise Exception(f"Error scanning for secrets: {error}")
+    
     log.info(f"Secrets scanning completed. Results saved to {output_file}")
+
 
 @click.group()
 @click.option("--debug", is_flag=True, help="Enable debug logging")
@@ -98,6 +115,7 @@ def cli(ctx, debug, config):
     ctx.ensure_object(dict)
     ctx.obj["config"] = Config(config_path=config)
     log.debug(f"Loaded configuration: {ctx.obj['config']}")
+
 
 @cli.command()
 @click.argument("targets", nargs=-1, required=False)
@@ -148,40 +166,35 @@ def scan(ctx, targets, output_dir, aggressive, verbose, secrets, url_file):
     except Exception as e:
         log.error(f"Unexpected error: {str(e)}")
 
+
 @cli.command()
 @click.argument("targets", nargs=-1, required=False)
 @click.option("--exp-name", "-e", required=True, help="Experiment name")
 @click.option('--output-dir', default='webql_output', help='Base output directory for analysis')
 @click.option("--secrets", "-s", is_flag=True, help="Run secrets scanning modules")
-def full_analysis(targets, exp_name, output_dir, secrets):
+@click.pass_context
+def full_analysis(ctx, targets, exp_name, output_dir, secrets):
     """Perform a full analysis on a given URL."""
     try:
+        if not targets:
+            targets = [line.strip() for line in sys.stdin if line.strip()]
+            
         targets = [url for url in list(targets) if check_url_status(url)]
 
-        #project_root = Path(__file__).parent.parent
         output_path = Path.cwd() / output_dir / exp_name
         output_path.mkdir(parents=True, exist_ok=True)
 
-        # console.print(f"[bold blue]Starting full analysis of {url}[/bold blue]")
         console.print(f"[bold blue]Output directory: {output_path}[/bold blue]")
 
         # Step 1: Scan the URL
         console.print("[yellow]Step 1: Scanning URL for JavaScript files...[/yellow]")
-        scan_cmd = f"python -m webql scan {' '.join(shlex.quote(t) for t in targets)} --output-dir {output_path}"
-        output, error = run_command(scan_cmd)
-        console.print(output)
-        if error:
-            raise Exception(f"Error during scan: {error}")
+        ctx.invoke(scan, targets=targets, output_dir=str(output_path), aggressive=False, verbose=False, secrets=False, url_file=None)
 
         # Step 2: Generate CodeQL database
         console.print("[yellow]Step 2: Generating CodeQL database...[/yellow]")
         db_name = f"{exp_name}_db"
         db_path = output_path / db_name
-        generate_cmd = f"python -m webql generate {output_path} --db-name {db_path} --overwrite"
-        output, error = run_command(generate_cmd)
-        console.print(output)
-        if error:
-            raise Exception(f"Error generating database: {error}")
+        ctx.invoke(generate, source_path=str(output_path), db_name=str(db_path), overwrite=True)
 
         console.print(f"[bold cyan]Database path: {db_path}[/bold cyan]")
         console.print(f"[bold cyan]Database exists: {db_path.exists()}[/bold cyan]")
@@ -189,33 +202,24 @@ def full_analysis(targets, exp_name, output_dir, secrets):
         # Step 3: Analyze the database
         console.print("[yellow]Step 3: Analyzing the database...[/yellow]")
         sarif_file = output_path / f"{exp_name}_results.sarif"
-        parse_cmd = f"python -m webql parse {db_path} --output-file {sarif_file}"
-        console.print(f"[dim]Running command: {parse_cmd}[/dim]")
-        output, error = run_command(parse_cmd)
-        console.print(output)
-        if error:
-            raise Exception(f"Error parsing database: {error}")
+        ctx.invoke(parse, db_path=str(db_path), output_file=str(sarif_file))
 
         # Step 4: Display results
         console.print("[yellow]Step 4: Displaying results...[/yellow]")
-        results_cmd = f"python -m webql results {sarif_file}"
-        output, error = run_command(results_cmd)
-        console.print(output)
-        if error:
-            raise Exception(f"Error displaying results: {error}")
+        ctx.invoke(results, results_file=str(sarif_file), format="text")
 
         console.print("[bold green]Full analysis completed successfully![/bold green]")
         console.print(f"[bold green]Results are saved in: {output_path}[/bold green]")
 
-        # if secrets:
-        #     log.info("Running secrets scanning modules...")
-        #     run_trufflehog(url, output_path)
-        #     log.info("Secrets scanning completed.")
-
-
+        if secrets:
+            log.info("Running secrets scanning modules...")
+            run_trufflehog(str(output_path), str(output_path))
+            log.info("Secrets scanning completed.")
 
     except Exception as e:
         console.print(f"[bold red]Error during full analysis: {str(e)}[/bold red]")
+        log.exception("Full analysis failed")
+
 
 @cli.command()
 @click.argument('source_path', type=click.Path(exists=True))
@@ -236,6 +240,8 @@ def generate(source_path, db_name, overwrite):
             console.print("[bold red]Failed to generate CodeQL database[/bold red]")
     except Exception as e:
         console.print(f"[bold red]Error during database generation: {str(e)}[/bold red]")
+        log.exception("Database generation failed")
+
 
 @cli.command()
 @click.argument("db_path", type=click.Path(exists=True))
@@ -274,11 +280,16 @@ def results(results_file, format):
         if format == 'json':
             console.print_json(data=vulnerabilities)
         else:
-            table = Table(title="Vulnerability Results")
-            table.add_column("Severity", style="cyan")
-            table.add_column("Rule ID", style="magenta")
-            table.add_column("Message", style="green")
-            table.add_column("Location", style="yellow", no_wrap=True)
+            table = Table(
+                title="Vulnerability Results",
+                box=ROUNDED,
+                show_lines=True,
+                expand=True
+            )
+            table.add_column("Severity", style="cyan", no_wrap=True, min_width=8)
+            table.add_column("Rule ID", style="magenta", overflow="fold", ratio=2)
+            table.add_column("Message", style="green", overflow="fold", ratio=4)
+            table.add_column("Location", style="yellow", overflow="fold", ratio=4)
 
             for severity, vulns in vulnerabilities.items():
                 for vuln in vulns:
@@ -286,7 +297,7 @@ def results(results_file, format):
                         severity.capitalize(),
                         vuln['rule_id'],
                         vuln['message'],
-                        vuln['location']
+                        shorten_location(vuln['location']),
                     )
             
             console.print(table)
@@ -294,12 +305,14 @@ def results(results_file, format):
         console.print("[bold green]Results processing completed[/bold green]")
     except Exception as e:
         console.print(f"[bold red]Error: {str(e)}[/bold red]")
+        log.exception("Results parsing failed")
 
 
 @click.group()
 def secrets():
     """JS secret and juicy bit scanning."""
     pass
+
 
 @click.command()
 @click.argument("target", type=click.Path(exists=True))
@@ -310,29 +323,29 @@ def secrets():
     help="Base output directory for analysis",
 )
 def trufflehog(target, output_dir):
-    """Scan for secrets and API keys using TruffleHog. You should target your JS directory..."""
+    """Scan for secrets and API keys using TruffleHog. Target should be a local directory path."""
     try:
-        # Parse the target to get the domain
-        parsed_url = urlparse(target)
-        domain = parsed_url.netloc.replace('.', '_')
+        target_path = Path(target)
         
         # Create the output directory if it doesn't exist
         output_path = Path(output_dir) / "secrets"
         output_path.mkdir(parents=True, exist_ok=True)
         
         # Define the output file path
-        output_file = output_path / f"trufflehog_{domain}_output.txt"
+        output_file = output_path / f"trufflehog_{target_path.name}_output.txt"
         
         # Run the trufflehog scan command
-        scan_command = f"trufflehog filesystem --directory {target} --json > {output_file}"
-        output, error = run_command(scan_command)
-        console.print(output)
-        if error:
+        scan_command = f"trufflehog filesystem --directory {target_path} --json > {output_file}"
+        output, error, returncode = run_command(scan_command)
+        console.print(output, markup=False, highlight=False)
+        
+        if returncode != 0:
             raise Exception(f"Error scanning for secrets: {error}")
 
         log.info(f"Secrets scanning completed. Results saved to {output_file}")
     except Exception as e:
         log.exception("An unexpected error occurred during secrets scanning")
+
 
 secrets.add_command(trufflehog)
 cli.add_command(secrets)
