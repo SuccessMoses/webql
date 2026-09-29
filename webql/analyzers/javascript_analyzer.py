@@ -6,15 +6,15 @@ import json
 from pathlib import Path
 from rich.progress import Progress
 from rich.console import Console
+import hashlib
 
 from .webcrack_analyzer import WebcrackAnalyzer
 
 console = Console()
 
 class JavaScriptAnalyzer:
-    def __init__(self, targets, base_url, output_dir, aggressive=False, verbose=False):
+    def __init__(self, targets, output_dir, aggressive=False, verbose=False):
         self.targets = targets
-        self.base_url = base_url
         self.output_dir = Path(output_dir)
         self.aggressive = aggressive
         self.verbose = verbose
@@ -22,7 +22,6 @@ class JavaScriptAnalyzer:
         self.visited_urls = set()
         self.progress = Progress()
         self.main_task_id = None
-        self.domain = urlparse(base_url).netloc
         self.webcrack_analyzer = WebcrackAnalyzer(output_dir, verbose)
 
     def scan(self):
@@ -31,7 +30,7 @@ class JavaScriptAnalyzer:
             self.main_task_id = self.progress.add_task("[green]Scanning...", total=len(self.targets))
             for target in self.targets:
                 self._scan_url(target)
-        console.print("[bold green]Scan completed![/bold green]")   
+        console.print("[bold green]Scan completed![/bold green]")
 
     def _scan_url(self, url):
         if url in self.visited_urls:
@@ -69,6 +68,26 @@ class JavaScriptAnalyzer:
 
         soup = BeautifulSoup(html_content, "html.parser")
 
+        inlines = soup.find_all("script", src=False)
+        inline_html = ""
+        SKIP_TYPES = {"importmap", "application/json", "application/ld+json"}
+        for inline in inlines:
+            if (inline.get("type") or "").lower() in SKIP_TYPES:
+                continue
+            inline_html += (inline.string if inline.string is not None else inline.get_text()) + "\n"
+
+        parsed = urlparse(url)
+        path = parsed.path.strip("/").replace("/", "_") or "root"
+        if parsed.query:
+            qhash = hashlib.sha1(parsed.query.encode()).hexdigest()[:8]
+            path = f"{path}_{qhash}"
+
+        file_name = f"{parsed.netloc}_{path}.js"
+        file_path = self.output_dir / file_name
+        file_path.write_text(inline_html)
+
+        self.webcrack_analyzer.run_webcrack(file_path)
+            
         script_tags = soup.find_all("script", src=True)
         if self.verbose:
             console.print(f"[blue]Found {len(script_tags)} script tags[/blue]")
@@ -106,7 +125,7 @@ class JavaScriptAnalyzer:
             console.print(f"[magenta]Processing JavaScript:[/magenta] {url}")
 
         parsed_url = urlparse(url)
-        file_name = f"{self.domain}_{parsed_url.path.split('/')[-1]}"
+        file_name = f"{parsed_url.netloc}_{parsed_url.path.split('/')[-1]}"
         file_path = self.output_dir / file_name
         file_path.write_text(js_content)
 
@@ -214,7 +233,7 @@ class JavaScriptAnalyzer:
             response = self.session.get(url)
             response.raise_for_status()
             parsed_url = urlparse(url)
-            file_name = f"{self.domain}_{parsed_url.path.split('/')[-1]}"
+            file_name = f"{parsed_url.netloc}_{parsed_url.path.split('/')[-1]}"
             file_path = self.output_dir / file_name
             file_path.write_text(response.text)
             if self.verbose:

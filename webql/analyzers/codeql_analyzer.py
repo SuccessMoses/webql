@@ -45,7 +45,7 @@ class CodeQLAnalyzer:
             )
             raise
 
-    def analyze_database(self, db_path, output_file, query_suite="javascript-lgtm.qls"):
+    def analyze_database(self, db_path, output_file, query_suite="codeql/javascript-queries"):
         console.print(f"[bold blue]Analyzing CodeQL database {db_path}[/bold blue]")
 
         cmd = [
@@ -57,6 +57,7 @@ class CodeQLAnalyzer:
             query_suite,
             "--format=sarif-latest",
             f"--output={output_file}",
+            "--rerun",
         ]
 
         try:

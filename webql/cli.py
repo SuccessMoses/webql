@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 from datetime import datetime
 
 import logging
+import shlex
 
 # Install rich traceback handler
 install(show_locals=True)
@@ -53,10 +54,10 @@ def run_command(command):
     output, error = process.communicate()
     return output.decode(), error.decode()
 
-def get_safe_filename(url):
-    """Convert URL to a safe filename."""
-    parsed_url = urlparse(url)
-    return f"{parsed_url.netloc.replace('.', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+# def get_safe_filename(url):
+#     """Convert URL to a safe filename."""
+#     parsed_url = urlparse(url)
+#     return f"{parsed_url.netloc.replace('.', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
 def check_url_status(url):
     try:
@@ -131,7 +132,7 @@ def scan(ctx, targets, output_dir, aggressive, verbose, secrets, url_file):
             raise click.UsageError("At least one target URL or --url-file must be provided.")
 
         log.info(f"Starting scan of {len(targets)} target(s)")
-        analyzer = JavaScriptAnalyzer(targets, targets[0] if targets else '', output_dir, aggressive=aggressive, verbose=verbose)
+        analyzer = JavaScriptAnalyzer(targets, output_dir, aggressive=aggressive, verbose=verbose)
 
         analyzer.scan()
         log.info(f"Scan completed. Results saved to {output_dir}")
@@ -148,26 +149,25 @@ def scan(ctx, targets, output_dir, aggressive, verbose, secrets, url_file):
         log.error(f"Unexpected error: {str(e)}")
 
 @cli.command()
-@click.argument('url')
+@click.argument("targets", nargs=-1, required=False)
+@click.option("--exp-name", "-e", required=True, help="Experiment name")
 @click.option('--output-dir', default='webql_output', help='Base output directory for analysis')
 @click.option("--secrets", "-s", is_flag=True, help="Run secrets scanning modules")
-def full_analysis(url, output_dir, secrets):
+def full_analysis(targets, exp_name, output_dir, secrets):
     """Perform a full analysis on a given URL."""
     try:
-        if not check_url_status(url):
-            return
+        targets = [url for url in list(targets) if check_url_status(url)]
 
         #project_root = Path(__file__).parent.parent
-        safe_url_name = get_safe_filename(url)
-        output_path = Path.cwd() / output_dir / safe_url_name
+        output_path = Path.cwd() / output_dir / exp_name
         output_path.mkdir(parents=True, exist_ok=True)
 
-        console.print(f"[bold blue]Starting full analysis of {url}[/bold blue]")
+        # console.print(f"[bold blue]Starting full analysis of {url}[/bold blue]")
         console.print(f"[bold blue]Output directory: {output_path}[/bold blue]")
 
         # Step 1: Scan the URL
         console.print("[yellow]Step 1: Scanning URL for JavaScript files...[/yellow]")
-        scan_cmd = f"python -m webql scan {url} --output-dir {output_path}"
+        scan_cmd = f"python -m webql scan {' '.join(shlex.quote(t) for t in targets)} --output-dir {output_path}"
         output, error = run_command(scan_cmd)
         console.print(output)
         if error:
@@ -175,7 +175,7 @@ def full_analysis(url, output_dir, secrets):
 
         # Step 2: Generate CodeQL database
         console.print("[yellow]Step 2: Generating CodeQL database...[/yellow]")
-        db_name = f"{safe_url_name}_db"
+        db_name = f"{exp_name}_db"
         db_path = output_path / db_name
         generate_cmd = f"python -m webql generate {output_path} --db-name {db_path} --overwrite"
         output, error = run_command(generate_cmd)
@@ -188,7 +188,7 @@ def full_analysis(url, output_dir, secrets):
 
         # Step 3: Analyze the database
         console.print("[yellow]Step 3: Analyzing the database...[/yellow]")
-        sarif_file = output_path / f"{safe_url_name}_results.sarif"
+        sarif_file = output_path / f"{exp_name}_results.sarif"
         parse_cmd = f"python -m webql parse {db_path} --output-file {sarif_file}"
         console.print(f"[dim]Running command: {parse_cmd}[/dim]")
         output, error = run_command(parse_cmd)
@@ -207,10 +207,10 @@ def full_analysis(url, output_dir, secrets):
         console.print("[bold green]Full analysis completed successfully![/bold green]")
         console.print(f"[bold green]Results are saved in: {output_path}[/bold green]")
 
-        if secrets:
-            log.info("Running secrets scanning modules...")
-            run_trufflehog(url, output_path)
-            log.info("Secrets scanning completed.")
+        # if secrets:
+        #     log.info("Running secrets scanning modules...")
+        #     run_trufflehog(url, output_path)
+        #     log.info("Secrets scanning completed.")
 
 
 
@@ -278,7 +278,7 @@ def results(results_file, format):
             table.add_column("Severity", style="cyan")
             table.add_column("Rule ID", style="magenta")
             table.add_column("Message", style="green")
-            table.add_column("Location", style="yellow")
+            table.add_column("Location", style="yellow", no_wrap=True)
 
             for severity, vulns in vulnerabilities.items():
                 for vuln in vulns:
