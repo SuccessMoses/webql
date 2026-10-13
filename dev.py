@@ -15,6 +15,13 @@ JavaScript is the first-class entity. Each URL is a *source* of JavaScript:
 Cross-URL relationships ("wikipedia.org uses google-analytics.js") live in
 the url_references table, keyed on (from_url_id, to_url_id, kind).
 
+Crawl state lives entirely in the DB: urls.fetched_ok is 0 for discovered-
+but-not-yet-attempted URLs, 1 for attempted (success *or* failure). The
+in-memory visited set is gone. Running the same seed twice is idempotent,
+and a crawl killed mid-flight can be resumed by running the same command
+again — the un-attempted URLs are picked up because they still have
+fetched_ok = 0.
+
 Example queries
 ---------------
 -- every URL that references a given JS file
@@ -38,6 +45,9 @@ SELECT u.url, u.kind FROM urls u JOIN reach r ON r.id = u.id
 SELECT j.content_hash, COUNT(DISTINCT u.domain_id) AS hosts
   FROM javascript j JOIN urls u ON u.javascript_id = j.id
  GROUP BY j.content_hash HAVING hosts > 1 ORDER BY hosts DESC;
+
+-- URLs discovered but never fetched (crawl frontier across runs)
+SELECT url FROM urls WHERE fetched_ok = 0;
 """
 
 from __future__ import annotations
@@ -198,7 +208,7 @@ class Database:
     # ---------------------------------------------------------------- #
 
     def get_or_create_url(self, url: str, domain_id: int) -> int:
-        """Ensure a URL row exists. New rows start kind='unknown', fetched_ok=0."""
+        """Ensure a URL row exists. New rows start fetched_ok=0."""
         self.conn.execute(
             """
             INSERT OR IGNORE INTO urls(url, domain_id, kind, fetched_ok)
@@ -212,9 +222,35 @@ class Database:
         ).fetchone()
         return int(row["id"])
 
+    def is_visited(self, url_id: int) -> bool:
+        """True once we have *attempted* to fetch this URL.
+
+        ``fetched_ok`` is set to 1 before the network call, so this covers
+        both success and failure — the crawl never retries a URL it already
+        tried, in this run or any prior one.
+        """
+        row = self.conn.execute(
+            "SELECT fetched_ok FROM urls WHERE id = ?", (url_id,)
+        ).fetchone()
+        return bool(row and row["fetched_ok"])
+
+    def mark_attempted(self, url_id: int) -> None:
+        """Record that we are about to fetch this URL.
+
+        Called before the network call so that failures still leave a
+        ``fetched_ok = 1`` row behind. Without this, a URL that 404s or
+        times out would stay at ``fetched_ok = 0`` and be retried forever
+        on a resumed crawl.
+        """
+        self.conn.execute(
+            "UPDATE urls SET fetched_ok = 1 WHERE id = ?", (url_id,)
+        )
+        self.conn.commit()
+
     def mark_url_fetched(
         self, url_id: int, kind: str, javascript_id: Optional[int]
     ) -> None:
+        """Record the outcome of a successful fetch: kind + JS blob + time."""
         self.conn.execute(
             """
             UPDATE urls
@@ -258,6 +294,7 @@ class Database:
             "domains":     one("SELECT COUNT(*) FROM domains"),
             "urls":        one("SELECT COUNT(*) FROM urls"),
             "fetched_ok":  one("SELECT COUNT(*) FROM urls WHERE fetched_ok = 1"),
+            "pending":     one("SELECT COUNT(*) FROM urls WHERE fetched_ok = 0"),
             "javascripts": one("SELECT COUNT(*) FROM javascript"),
             "references":  one("SELECT COUNT(*) FROM url_references"),
         }
@@ -388,10 +425,8 @@ def classify_html(content: str, base_url: str) -> Resource:
         if text and text.strip():
             inline_parts.append(text)
 
-    # Concatenate inline scripts into a single JS blob for this page.
     js_blob = "\n\n".join(inline_parts) if inline_parts else None
 
-    # Scan the concatenated inline code for URL references.
     if js_blob:
         for child_url, kind in _scan_js_refs(js_blob, base_url):
             refs.append((child_url, kind))
@@ -420,7 +455,6 @@ def classify_json(content: str, base_url: str) -> Resource:
     except json.JSONDecodeError:
         return Resource(kind="json", js_blob=None, references=[])
 
-    # Sourcemaps are also JSON.
     if (isinstance(data, dict)
             and "version" in data
             and "mappings" in data):
@@ -430,7 +464,6 @@ def classify_json(content: str, base_url: str) -> Resource:
     refs: List[Tuple[str, str]] = []
 
     if isinstance(data, dict):
-        # Next.js build manifest: {"pages": {"page": ["/chunk1.js", ...]}}
         pages = data.get("pages")
         if isinstance(pages, dict):
             for _page, files in pages.items():
@@ -439,7 +472,6 @@ def classify_json(content: str, base_url: str) -> Resource:
                         if isinstance(f, str) and f.endswith(".js"):
                             refs.append((urljoin(base_url, f), "manifest"))
 
-        # Remix: {"entry": {...}, "routes": {"route": {"imports": [...]}}}
         entry = data.get("entry")
         if isinstance(entry, dict):
             for _k, v in entry.items():
@@ -473,7 +505,6 @@ def classify(content: str, content_type: str, url: str) -> Resource:
     if "json" in ct or path.endswith(".json"):
         return classify_json(content, url)
 
-    # Fallback sniffing
     stripped = content.lstrip()
     head = stripped[:400].lower()
     if head.startswith(("{", "[")):
@@ -563,24 +594,16 @@ class Crawler:
         self.session.headers["User-Agent"] = (
             user_agent or "webql/0.1 (+https://example.invalid)"
         )
-        self.visited: set = set()
 
     # ---------------------------------------------------------------- #
     # public
     # ---------------------------------------------------------------- #
 
     def run(self, seeds: Iterable[str]) -> None:
-        queue: deque = deque()
-        for s in seeds:
-            if s not in self.visited:
-                queue.append(s)
+        queue: deque = deque(seeds)
 
         while queue:
             url = queue.popleft()
-            if url in self.visited:
-                continue
-            self.visited.add(url)
-
             try:
                 children = self._process(url)
             except Exception as e:  # noqa: BLE001
@@ -588,9 +611,7 @@ class Crawler:
                 continue
 
             if self.follow_refs:
-                for c in children:
-                    if c not in self.visited:
-                        queue.append(c)
+                queue.extend(children)
 
     # ---------------------------------------------------------------- #
     # internals
@@ -603,6 +624,14 @@ class Crawler:
 
         domain_id = self.db.get_or_create_domain(parsed.netloc, parsed.scheme)
         url_id = self.db.get_or_create_url(url, domain_id)
+
+        # Crawl state lives in the DB. Already attempted in this run or a
+        # previous one? Skip. `mark_attempted` below flips fetched_ok so
+        # re-queuing the same URL is free.
+        if self.db.is_visited(url_id):
+            return []
+
+        self.db.mark_attempted(url_id)
 
         if self.verbose:
             log(f"[fetch] {url}")
@@ -632,7 +661,6 @@ class Crawler:
                 self.db.add_reference(url_id, final_id, "redirect")
                 self.db.mark_url_fetched(url_id, kind="redirect",
                                          javascript_id=None)
-                self.visited.add(resp.url)
                 url_id = final_id
                 if self.verbose:
                     log(f"  -> redirect: {resp.url}")
