@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """
-webql_analyze — run CodeQL over every unscanned JavaScript blob in a webql DB.
+webql_analyze — run CodeQL over webcracked JavaScript blobs in a webql DB.
 
 Reads a DB produced by webql.py. On first run it adds an `analyzed_at`
 column to the javascript table (NULL = unscanned) and creates a findings
 table. Subsequent runs skip blobs where analyzed_at IS NOT NULL.
+
+Only blobs with a populated `javascript.webcracked_content` column are
+analysed. Raw minified/bundled code is not acceptable input to CodeQL:
+the extractor parses it, but the AST is pathological and the query suite
+was trained against source, not bundler output. Re-crawl with
+`webql.py --webcrack` to populate the column.
 
 One blob per CodeQL run. Batching all blobs into a single source directory
 causes CodeQL's JS extractor to load them all into memory and OOM on
@@ -24,14 +30,14 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 # =========================================================================== #
 # schema bits this CLI owns
@@ -47,8 +53,7 @@ CREATE TABLE IF NOT EXISTS findings (
     file_path     TEXT,
     start_line    INTEGER,
     end_line      INTEGER,
-    analyzed_at   TEXT NOT NULL,
-    UNIQUE (javascript_id, rule_id, file_path, start_line)
+    analyzed_at   TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_findings_js       ON findings(javascript_id);
@@ -61,6 +66,10 @@ DEFAULT_QUERY_SUITE = "codeql/javascript-queries"
 
 def log(msg: str) -> None:
     print(msg, file=sys.stderr)
+
+
+def utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 # =========================================================================== #
@@ -140,16 +149,36 @@ class AnalyzerDB:
         )
 
     def count_pending(self) -> int:
+        """Blobs that are candidates for analysis and not yet scanned.
+
+        Only counts blobs with webcracked content, because those are the
+        only ones the work queue will hand out. Blobs missing webcracked
+        content are reported separately by count_missing_webcracked().
+        """
         return int(
             self.conn.execute(
-                "SELECT COUNT(*) FROM javascript WHERE analyzed_at IS NULL"
+                "SELECT COUNT(*) FROM javascript "
+                " WHERE analyzed_at IS NULL "
+                "   AND webcracked_content IS NOT NULL "
+                "   AND webcracked_content != ''"
+            ).fetchone()[0]
+        )
+
+    def count_missing_webcracked(self) -> int:
+        """Blobs that can never enter the queue until re-crawled."""
+        return int(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM javascript "
+                " WHERE analyzed_at IS NULL "
+                "   AND (webcracked_content IS NULL "
+                "        OR webcracked_content = '')"
             ).fetchone()[0]
         )
 
     def get_pending_blobs(
         self, limit: Optional[int] = None, force: bool = False
     ) -> List[sqlite3.Row]:
-        """Blobs CodeQL has not yet looked at.
+        """Blobs CodeQL has not yet looked at, restricted to webcracked input.
 
         This is the answer to "how do we know what's been scanned?" —
         `analyzed_at IS NULL`. It works for blobs with zero findings, and
@@ -157,11 +186,13 @@ class AnalyzerDB:
         """
         sql = (
             "SELECT id, content, webcracked_content, content_hash, "
-            "       length(content) AS size "
+            "       length(webcracked_content) AS size "
             "  FROM javascript "
+            " WHERE webcracked_content IS NOT NULL "
+            "   AND webcracked_content != '' "
         )
         if not force:
-            sql += " WHERE analyzed_at IS NULL "
+            sql += "   AND analyzed_at IS NULL "
         sql += " ORDER BY id "
         if limit is not None:
             sql += f" LIMIT {int(limit)}"
@@ -175,13 +206,11 @@ class AnalyzerDB:
         Marking on failure matters: without it, a blob whose analysis keeps
         crashing stays `analyzed_at IS NULL` and gets retried forever.
         """
-        from datetime import datetime, timezone
-        now = datetime.now(timezone.utc).isoformat()
         self.conn.execute(
             "UPDATE javascript "
             "   SET analyzed_at = ?, analysis_error = ? "
             " WHERE id = ?",
-            (now, error[:500] if error else None, js_id),
+            (utcnow(), error[:500] if error else None, js_id),
         )
         self.conn.commit()
 
@@ -189,11 +218,16 @@ class AnalyzerDB:
     # findings
     # ---------------------------------------------------------------- #
 
-    def insert_finding(self, js_id: int, finding: dict) -> bool:
-        from datetime import datetime, timezone
-        cur = self.conn.execute(
+    def insert_finding(self, js_id: int, finding: dict) -> None:
+        """Store one finding verbatim.
+
+        No dedup: the schema has no UNIQUE constraint. Duplicate prevention
+        happens at the blob level (`analyzed_at IS NULL` gates the work
+        queue), and any finer-grained dedup is the triager's job.
+        """
+        self.conn.execute(
             """
-            INSERT OR IGNORE INTO findings
+            INSERT INTO findings
                 (javascript_id, rule_id, severity, message,
                  file_path, start_line, end_line, analyzed_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -206,10 +240,9 @@ class AnalyzerDB:
                 finding.get("file_path"),
                 finding.get("start_line"),
                 finding.get("end_line"),
-                datetime.now(timezone.utc).isoformat(),
+                utcnow(),
             ),
         )
-        return cur.rowcount > 0
 
     def commit(self) -> None:
         self.conn.commit()
@@ -238,7 +271,7 @@ class AnalyzerDB:
             return
         for r in rows:
             log(
-                f"  [{r['severity']:<8}] js={r['javascript_id']:<5} "
+                f"  [{r['severity'] or '?':<8}] js={r['javascript_id']:<5} "
                 f"L{r['start_line'] or '?':<5} {r['rule_id']}: {r['message']}"
             )
 
@@ -302,7 +335,7 @@ def analyze_blob(
     query_suite: str,
     timeout: float,
     verbose: bool,
-) -> tuple[Optional[List[dict]], Optional[str]]:
+) -> Tuple[Optional[List[dict]], Optional[str]]:
     """Run CodeQL over one blob. Returns (findings, error)."""
     src_dir = work_dir / "src"
     src_dir.mkdir(parents=True, exist_ok=True)
@@ -364,22 +397,26 @@ def analyze_blob(
 # main
 # =========================================================================== #
 
-def _pick_content(row: sqlite3.Row, use_webcracked: bool) -> str:
-    """Choose which version of the blob to analyze.
+def _pick_content(row: sqlite3.Row) -> Tuple[Optional[str], Optional[str]]:
+    """Return the text to analyze. Only webcracked content is acceptable.
 
-    Webcracked output is un-minified and easier for CodeQL to reason about,
-    but if it's absent, fall back to the original. Findings' line numbers
-    refer to whichever version was used.
+    Feeding raw minified/bundled JS to CodeQL produces pathological ASTs,
+    slow queries, and false positives. We require the webcracked version.
+    Returns (content, error); exactly one of them is None.
     """
-    if use_webcracked and row["webcracked_content"]:
-        return row["webcracked_content"]
-    return row["content"] or ""
+    wc = row["webcracked_content"]
+    if wc and wc.strip():
+        return wc, None
+    return None, (
+        "no webcracked content — re-crawl with `webql.py --webcrack` "
+        "to populate javascript.webcracked_content"
+    )
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="webql_analyze",
-        description="Run CodeQL over unscanned JavaScript blobs in a webql DB.",
+        description="Run CodeQL over webcracked JavaScript blobs in a webql DB.",
     )
     parser.add_argument(
         "-d", "--db", required=True,
@@ -399,11 +436,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument(
         "--force", action="store_true",
-        help="Re-analyze every blob, ignoring analyzed_at",
-    )
-    parser.add_argument(
-        "--webcracked", action="store_true",
-        help="Analyze the webcracked version when available",
+        help="Re-analyze every webcracked blob, ignoring analyzed_at",
     )
     parser.add_argument(
         "--timeout", type=float, default=600.0,
@@ -445,10 +478,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # 3. work to do?
         total = db.count_total()
         pending = db.count_pending()
+        missing_wc = db.count_missing_webcracked()
         log(
             f"[webql-analyze] {total} blob(s) total, "
-            f"{pending} unscanned"
+            f"{pending} unscanned, "
+            f"{missing_wc} missing webcracked content"
         )
+        if missing_wc:
+            log(
+                "[webql-analyze] blobs without webcracked content are skipped — "
+                "re-run webql.py with --webcrack to populate them"
+            )
         if pending == 0 and not args.force:
             log("[webql-analyze] nothing to do "
                 "(use --force to re-analyze everything)")
@@ -466,6 +506,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # 4. main loop
         scanned = 0
         failed = 0
+        skipped = 0
         total_findings = 0
         started = time.time()
 
@@ -478,12 +519,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             log(header)
 
-            content = _pick_content(row, args.webcracked)
-            if not content.strip():
-                if args.verbose:
-                    log("    empty blob, skipping")
-                db.mark_blob_analyzed(js_id)
-                scanned += 1
+            content, pick_err = _pick_content(row)
+            if pick_err is not None:
+                log(f"    SKIPPED: {pick_err}")
+                # Do NOT mark analyzed — we want to come back once the
+                # webcracked column is populated by a fresh crawl.
+                skipped += 1
                 continue
 
             if args.keep_staging:
@@ -523,17 +564,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 db.mark_blob_analyzed(js_id, error=err)
                 continue
 
-            inserted = 0
+            n_findings = len(findings or [])
             for f in findings or []:
-                if db.insert_finding(js_id, f):
-                    inserted += 1
+                db.insert_finding(js_id, f)
             db.commit()
             db.mark_blob_analyzed(js_id)
 
             scanned += 1
-            total_findings += inserted
-            if findings:
-                log(f"    {inserted} finding(s) in {elapsed:.1f}s")
+            total_findings += n_findings
+            if n_findings:
+                log(f"    {n_findings} finding(s) in {elapsed:.1f}s")
             elif args.verbose:
                 log(f"    clean in {elapsed:.1f}s")
 
@@ -542,6 +582,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log("")
         log("[webql-analyze] --- summary ---")
         log(f"  blobs analysed : {scanned}")
+        log(f"  blobs skipped  : {skipped}")
         log(f"  blobs failed   : {failed}")
         log(f"  findings added : {total_findings}")
         log(f"  elapsed        : {wall:.1f}s")
